@@ -1,0 +1,5 @@
+# Carries build.sh's output, nothing else: the .debs (`leyla-ffmpeg`) or
+# their source (`leyla-ffmpeg-source`). Never run; deploy/docker/Dockerfile
+# and deploy/ci/Dockerfile copy the package for their architecture out of it.
+FROM scratch
+COPY . /

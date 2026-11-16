@@ -1,0 +1,145 @@
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -168,6 +168,10 @@
+     float readrate_catchup;
+     double readrate_initial_burst;
+     int accurate_seek;
++    /* Leyla: skip decoding non-reference video frames before this time */
++    int64_t skip_nonref_before;
++    /* Leyla: -ss lands on the keyframe at or before it, no decode-delay allowance */
++    int seek_at_pts;
+     int thread_queue_size;
+     int input_sync_ref;
+     int find_stream_info;
+@@ -462,6 +466,11 @@
+     // Either forced (when DECODER_FLAG_FRAMERATE_FORCED is set) or
+     // estimated (otherwise) video framerate.
+     AVRational                  framerate;
++
++    // Leyla: video frames whose packet pts is before this (AV_TIME_BASE,
++    // on the timeline the input's packets are stamped on) are decoded
++    // only when other frames reference them. AV_NOPTS_VALUE: off.
++    int64_t                     skip_nonref_before;
+ } DecoderOpts;
+ 
+ typedef struct Decoder {
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -147,6 +147,7 @@
+     o->limit_filesize = INT64_MAX;
+     o->chapters_input_file = INT_MAX;
+     o->accurate_seek  = 1;
++    o->skip_nonref_before = AV_NOPTS_VALUE;
+     o->thread_queue_size = 0;
+     o->input_sync_ref = -1;
+     o->find_stream_info = 1;
+@@ -1688,6 +1689,14 @@
+     { "accurate_seek",          OPT_TYPE_BOOL, OPT_OFFSET | OPT_EXPERT | OPT_INPUT,
+         { .off = OFFSET(accurate_seek) },
+         "enable/disable accurate seeking with -ss" },
++    { "seek_at_pts",            OPT_TYPE_BOOL, OPT_OFFSET | OPT_EXPERT | OPT_INPUT,
++        { .off = OFFSET(seek_at_pts) },
++        "seek -ss as a presentation time: land on the keyframe at or before it, "
++        "without the allowance for decode delay" },
++    { "skip_nonref_before",     OPT_TYPE_TIME, OPT_OFFSET | OPT_EXPERT | OPT_INPUT,
++        { .off = OFFSET(skip_nonref_before) },
++        "skip decoding non-reference video frames timestamped before this time "
++        "(on the input's timeline after -copyts/-start_at_zero/-ss)", "time" },
+     { "isync",                  OPT_TYPE_INT, OPT_OFFSET | OPT_EXPERT | OPT_INPUT,
+         { .off = OFFSET(input_sync_ref) },
+         "Indicate the input index for sync reference", "sync ref" },
+--- a/fftools/ffmpeg_demux.c
++++ b/fftools/ffmpeg_demux.c
+@@ -121,6 +121,7 @@
+ 
+     int64_t               recording_time;
+     int                   accurate_seek;
++    int64_t               skip_nonref_before;
+ 
+     /* number of times input stream should be looped */
+     int                   loop;
+@@ -1006,6 +1007,10 @@
+ #endif
+                              ;
+ 
++        ds->dec_opts.skip_nonref_before =
++            ist->st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ?
++            d->skip_nonref_before : AV_NOPTS_VALUE;
++
+         if (ist->framerate.num) {
+             ds->dec_opts.flags     |= DECODER_FLAG_FRAMERATE_FORCED;
+             ds->dec_opts.framerate  = ist->framerate;
+@@ -2193,7 +2198,10 @@
+     if (start_time != AV_NOPTS_VALUE) {
+         int64_t seek_timestamp = timestamp;
+ 
+-        if (!(ic->iformat->flags & AVFMT_SEEK_TO_PTS)) {
++        // Leyla: -seek_at_pts for a demuxer whose index is of presentation
++        // times (Matroska's cues): the allowance below would land a seek
++        // that names a keyframe on the keyframe before it.
++        if (!(ic->iformat->flags & AVFMT_SEEK_TO_PTS) && !o->seek_at_pts) {
+             int dts_heuristic = 0;
+             for (int i = 0; i < ic->nb_streams; i++) {
+                 const AVCodecParameters *par = ic->streams[i]->codecpar;
+@@ -2219,6 +2227,7 @@
+     f->input_ts_offset = o->input_ts_offset;
+     f->ts_offset  = o->input_ts_offset - (copy_ts ? (start_at_zero && ic->start_time != AV_NOPTS_VALUE ? ic->start_time : 0) : timestamp);
+     d->accurate_seek   = o->accurate_seek;
++    d->skip_nonref_before = o->skip_nonref_before;
+     d->loop = o->loop;
+     d->nb_streams_warn = ic->nb_streams;
+ 
+--- a/fftools/ffmpeg_dec.c
++++ b/fftools/ffmpeg_dec.c
+@@ -54,6 +54,11 @@
+     int                 flags;
+     int                 apply_cropping;
+ 
++    // Leyla: DecoderOpts.skip_nonref_before, and the skip_frame the
++    // decoder was opened with (restored from that time on)
++    int64_t             skip_nonref_before;
++    enum AVDiscard      skip_frame_opened;
++
+     enum AVPixelFormat  hwaccel_pix_fmt;
+     enum HWAccelID      hwaccel_id;
+     enum AVHWDeviceType hwaccel_device_type;
+@@ -723,6 +728,19 @@
+         fd->wallclock[LATENCY_PROBE_DEC_PRE] = av_gettime_relative();
+     }
+ 
++    // Leyla: a picture timestamped before the start that no other picture
++    // refers to is never shown (the start's trim drops it) and never needed;
++    // the decoder skips it. Set per packet: frame threads copy skip_frame
++    // from this context on every submission.
++    if (dp->skip_nonref_before != AV_NOPTS_VALUE && pkt) {
++        enum AVDiscard skip = dp->skip_frame_opened;
++        if (pkt->pts != AV_NOPTS_VALUE &&
++            av_compare_ts(pkt->pts, dec->pkt_timebase,
++                          dp->skip_nonref_before, AV_TIME_BASE_Q) < 0)
++            skip = FFMAX(skip, AVDISCARD_NONREF);
++        dec->skip_frame = skip;
++    }
++
+     ret = avcodec_send_packet(dec, pkt);
+     if (ret < 0 && !(ret == AVERROR_EOF && !pkt)) {
+         // In particular, we don't expect AVERROR(EAGAIN), because we read all
+@@ -850,6 +868,8 @@
+         return AVERROR_BUG;
+ 
+     memset(&o, 0, sizeof(o));
++    // Leyla: a loopback decoder skips nothing (zero would be a time).
++    o.skip_nonref_before = AV_NOPTS_VALUE;
+ 
+     o.par       = fd->par_enc;
+     o.time_base = pkt->time_base;
+@@ -1610,6 +1630,10 @@
+         return ret;
+     }
+ 
++    dp->skip_nonref_before = codec->type == AVMEDIA_TYPE_VIDEO ?
++                             o->skip_nonref_before : AV_NOPTS_VALUE;
++    dp->skip_frame_opened  = dp->dec_ctx->skip_frame;
++
+     if (dp->dec_ctx->hw_device_ctx) {
+         // Update decoder extra_hw_frames option to account for the
+         // frames held in queues inside the ffmpeg utility.  This is

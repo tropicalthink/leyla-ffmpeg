@@ -1,0 +1,280 @@
+--- a/libavfilter/vf_amf_common.c
++++ b/libavfilter/vf_amf_common.c
+@@ -337,7 +337,12 @@
+     hwframes_out->format    = AV_PIX_FMT_AMF_SURFACE;
+     hwframes_out->sw_format = out_sw_format;
+ 
+-    if (inlink->format == AV_PIX_FMT_AMF_SURFACE) {
++    /* Leyla: a hardware input (AMF surfaces, and the D3D11 or DXVA2 frames
++     * amf_avframe_to_amfsurface wraps as AMF surfaces on their own device)
++     * is converted from its frames' software format. The link's format
++     * (AV_PIX_FMT_D3D11) names no AMF surface format, and the converter's
++     * Init failed with AMF_NOT_SUPPORTED (10) after every d3d11va decode. */
++    if (inl->hw_frames_ctx) {
+         *in_format = in_sw_format;
+     } else {
+         *in_format = inlink->format;
+--- a/libavfilter/vf_amf_common.h
++++ b/libavfilter/vf_amf_common.h
+@@ -50,6 +50,13 @@
+     int force_divisible_by;
+     int reset_sar;
+ 
++    // Leyla (leyla-vpp-amf-hdr.patch): vpp_amf's HDR to SDR. Init waits
++    // for the first frame, whose colour and HDR10 metadata it is given.
++    int tonemap;
++    int deferred_init;
++    int initialized;
++    enum AVPixelFormat init_format;
++
+     AMFComponent        *component;
+     AVBufferRef         *amf_device_ref;
+ 
+--- a/libavfilter/vf_vpp_amf.c
++++ b/libavfilter/vf_vpp_amf.c
+@@ -51,11 +51,61 @@
+ #include <d3d11.h>
+ #endif
+ 
++#include "libavutil/mastering_display_metadata.h"
++
++/* Leyla: the colour space and range the options make the output, or
++ * unspecified where they leave it as the input's. */
++static int vpp_amf_output_color_space(const AMFFilterContext *ctx)
++{
++    switch (ctx->color_profile) {
++    case AMF_VIDEO_CONVERTER_COLOR_PROFILE_601:  return AVCOL_SPC_SMPTE170M;
++    case AMF_VIDEO_CONVERTER_COLOR_PROFILE_709:  return AVCOL_SPC_BT709;
++    case AMF_VIDEO_CONVERTER_COLOR_PROFILE_2020: return AVCOL_SPC_BT2020_NCL;
++    default:                                     return AVCOL_SPC_UNSPECIFIED;
++    }
++}
++
++static int vpp_amf_output_color_range(const AMFFilterContext *ctx)
++{
++    switch (ctx->color_range) {
++    case AMF_COLOR_RANGE_STUDIO: return AVCOL_RANGE_MPEG;
++    case AMF_COLOR_RANGE_FULL:   return AVCOL_RANGE_JPEG;
++    default:                     return AVCOL_RANGE_UNSPECIFIED;
++    }
++}
++
++/* Leyla: one property of the converter's colour negotiation, the input's
++ * free and the output's what the options make it (or the input's own). */
++static int vpp_amf_negotiate(AVFilterFormats **in, AVFilterFormats **out,
++                             AVFilterFormats *all, int fixed)
++{
++    int err;
++    if ((err = ff_formats_ref(all, in)) < 0)
++        return err;
++    if (fixed < 0)
++        return ff_formats_ref(all, out); // shared: output is the input's
++    return ff_formats_ref(ff_make_formats_list_singleton(fixed), out);
++}
++
++/* Leyla: what this filter takes and makes. Its output frames are always AMF
++ * surfaces (amf_init_filter_config makes an AMF frames context whatever
++ * device the filters were given), so it says so, rather than D3D11 frames
++ * when -filter_hw_device names a D3D11 device. D3D11 and DXVA2 input frames
++ * are wrapped as AMF surfaces on the device they came from. And it states
++ * its output's colour space and range: left to the default, they had to be
++ * the input's, and an encoder asked for BT.709 from a BT.2020 source got a
++ * software scaler after this filter, which takes no hardware frame. */
+ static int amf_filter_query_formats(AVFilterContext *avctx)
+ {
+-    const enum AVPixelFormat *output_pix_fmts;
++    AMFFilterContext *ctx = avctx->priv;
+     static const enum AVPixelFormat input_pix_fmts[] = {
+         AV_PIX_FMT_AMF_SURFACE,
++#if CONFIG_D3D11VA
++        AV_PIX_FMT_D3D11,
++#endif
++#if CONFIG_DXVA2
++        AV_PIX_FMT_DXVA2_VLD,
++#endif
+         AV_PIX_FMT_NV12,
+         AV_PIX_FMT_P010,
+         AV_PIX_FMT_0RGB,
+@@ -69,18 +119,137 @@
+         AV_PIX_FMT_YUYV422,
+         AV_PIX_FMT_NONE,
+     };
+-    static const enum AVPixelFormat output_pix_fmts_default[] = {
++    static const enum AVPixelFormat output_pix_fmts[] = {
+         AV_PIX_FMT_AMF_SURFACE,
+-        AV_PIX_FMT_D3D11,
+-        AV_PIX_FMT_DXVA2_VLD,
+-        AV_PIX_FMT_NV12,
+-        AV_PIX_FMT_BGRA,
+-        AV_PIX_FMT_YUV420P,
+         AV_PIX_FMT_NONE,
+     };
+-    output_pix_fmts = output_pix_fmts_default;
++    int space = vpp_amf_output_color_space(ctx);
++    int range = vpp_amf_output_color_range(ctx);
++    int err;
++
++    if ((err = ff_formats_ref(ff_make_pixel_format_list(input_pix_fmts),
++                              &avctx->inputs[0]->outcfg.formats)) < 0)
++        return err;
++    if ((err = ff_formats_ref(ff_make_pixel_format_list(output_pix_fmts),
++                              &avctx->outputs[0]->incfg.formats)) < 0)
++        return err;
++    if ((err = vpp_amf_negotiate(&avctx->inputs[0]->outcfg.color_spaces,
++                                 &avctx->outputs[0]->incfg.color_spaces,
++                                 ff_all_color_spaces(),
++                                 space == AVCOL_SPC_UNSPECIFIED ? -1 : space)) < 0)
++        return err;
++    return vpp_amf_negotiate(&avctx->inputs[0]->outcfg.color_ranges,
++                             &avctx->outputs[0]->incfg.color_ranges,
++                             ff_all_color_ranges(),
++                             range == AVCOL_RANGE_UNSPECIFIED ? -1 : range);
++}
+ 
+-    return amf_setup_input_output_formats(avctx, input_pix_fmts, output_pix_fmts);
++/* Leyla: the input's HDR10 metadata in AMF's units (as amfenc.c reads it). */
++static void vpp_amf_hdr_metadata(const AVFrame *frame, AMFHDRMetadata *meta)
++{
++    const AVFrameSideData *sd_display = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++    const AVFrameSideData *sd_light = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++
++    memset(meta, 0, sizeof(*meta));
++    if (sd_display) {
++        const AVMasteringDisplayMetadata *display = (const AVMasteringDisplayMetadata *)sd_display->data;
++        if (display->has_luminance) {
++            meta->maxMasteringLuminance = (amf_uint32)(10000 * av_q2d(display->max_luminance));
++            meta->minMasteringLuminance = FFMIN((amf_uint32)(10000 * av_q2d(display->min_luminance)),
++                                                meta->maxMasteringLuminance);
++        }
++        if (display->has_primaries) {
++            const unsigned den = 50000;
++#define CHROMA(q) FFMIN((amf_uint16)(den * av_q2d(q)), den)
++            meta->redPrimary[0]   = CHROMA(display->display_primaries[0][0]);
++            meta->redPrimary[1]   = CHROMA(display->display_primaries[0][1]);
++            meta->greenPrimary[0] = CHROMA(display->display_primaries[1][0]);
++            meta->greenPrimary[1] = CHROMA(display->display_primaries[1][1]);
++            meta->bluePrimary[0]  = CHROMA(display->display_primaries[2][0]);
++            meta->bluePrimary[1]  = CHROMA(display->display_primaries[2][1]);
++            meta->whitePoint[0]   = CHROMA(display->white_point[0]);
++            meta->whitePoint[1]   = CHROMA(display->white_point[1]);
++#undef CHROMA
++        }
++    }
++    if (sd_light) {
++        const AVContentLightMetadata *light = (const AVContentLightMetadata *)sd_light->data;
++        meta->maxContentLightLevel = (amf_uint16)FFMIN(light->MaxCLL, 65535);
++        meta->maxFrameAverageLightLevel = (amf_uint16)FFMIN(light->MaxFALL, 65535);
++    }
++}
++
++/* Leyla: tell the converter what the input is (its transfer, PQ or HLG; its
++ * primaries; its range; its HDR10 mastering and content light levels) and
++ * how to map it, from the first frame, before Init. Without them it had no
++ * HDR input to map from. The AMF enums are ISO/IEC 23001-8's, as ffmpeg's. */
++static int vpp_amf_set_input_color(AVFilterContext *avctx, const AVFrame *in)
++{
++    AMFFilterContext *ctx = avctx->priv;
++    AMF_RESULT res;
++
++    if (in->color_trc != AVCOL_TRC_UNSPECIFIED) {
++        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_TRANSFER_CHARACTERISTIC, (amf_int64)in->color_trc);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-SetProperty(InputTransferChar) failed with error %d\n", res);
++    }
++    if (in->color_primaries != AVCOL_PRI_UNSPECIFIED) {
++        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_COLOR_PRIMARIES, (amf_int64)in->color_primaries);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-SetProperty(InputColorPrimaries) failed with error %d\n", res);
++    }
++    if (in->color_range == AVCOL_RANGE_MPEG || in->color_range == AVCOL_RANGE_JPEG) {
++        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_COLOR_RANGE,
++                                  in->color_range == AVCOL_RANGE_JPEG ? AMF_COLOR_RANGE_FULL : AMF_COLOR_RANGE_STUDIO);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-SetProperty(InputColorRange) failed with error %d\n", res);
++    }
++    if (ctx->tonemap != AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED) {
++        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_TONEMAPPING, ctx->tonemap);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-SetProperty(InputTonemapping) failed with error %d\n", res);
++    }
++    if (av_frame_get_side_data(in, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA) ||
++        av_frame_get_side_data(in, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
++        AMFBuffer *buffer = NULL;
++        res = ctx->amf_device_ctx->context->pVtbl->AllocBuffer(ctx->amf_device_ctx->context, AMF_MEMORY_HOST,
++                                                              sizeof(AMFHDRMetadata), &buffer);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR(ENOMEM), "AllocBuffer() failed with error %d\n", res);
++        vpp_amf_hdr_metadata(in, (AMFHDRMetadata *)buffer->pVtbl->GetNative(buffer));
++        AMF_ASSIGN_PROPERTY_INTERFACE(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_HDR_METADATA, buffer);
++        buffer->pVtbl->Release(buffer);
++        AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-SetProperty(InputHdrMetadata) failed with error %d\n", res);
++    }
++    return 0;
++}
++
++/* Leyla: Init on the first frame (its colour set first); a tone-mapped
++ * picture leaves its source's HDR10 descriptions behind. */
++static int vpp_amf_filter_frame(AVFilterLink *inlink, AVFrame *in)
++{
++    AVFilterContext *avctx = inlink->dst;
++    AMFFilterContext *ctx = avctx->priv;
++    AMF_RESULT res;
++    int err;
++
++    if (!ctx->component) {
++        av_frame_free(&in);
++        return AVERROR(EINVAL);
++    }
++    if (!ctx->initialized) {
++        if ((err = vpp_amf_set_input_color(avctx, in)) < 0) {
++            av_frame_free(&in);
++            return err;
++        }
++        res = ctx->component->pVtbl->Init(ctx->component, av_av_to_amf_format(ctx->init_format), inlink->w, inlink->h);
++        if (res != AMF_OK) {
++            av_log(avctx, AV_LOG_ERROR, "AMFConverter-Init() failed with error %d\n", res);
++            av_frame_free(&in);
++            return AVERROR_UNKNOWN;
++        }
++        ctx->initialized = 1;
++    }
++    if (ctx->tonemap != AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED) {
++        av_frame_remove_side_data(in, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
++        av_frame_remove_side_data(in, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
++    }
++    return amf_filter_filter_frame(inlink, in);
+ }
+ 
+ static int amf_filter_config_output(AVFilterLink *outlink)
+@@ -159,8 +328,11 @@
+         AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_OUTPUT_TRANSFER_CHARACTERISTIC, ctx->trc);
+     }
+ 
+-    res = ctx->component->pVtbl->Init(ctx->component, av_av_to_amf_format(in_format), inlink->w, inlink->h);
+-    AMF_RETURN_IF_FALSE(avctx, res == AMF_OK, AVERROR_UNKNOWN, "AMFConverter-Init() failed with error %d\n", res);
++    /* Leyla: Init waits for the first frame (vpp_amf_filter_frame), whose
++     * colour and HDR10 metadata the converter is given first. */
++    ctx->init_format = in_format;
++    ctx->initialized = 0;
++    ctx->deferred_init = 1;
+ 
+     return 0;
+ }
+@@ -222,6 +394,13 @@
+     { "increase", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = SCALE_FORCE_OAR_INCREASE }, 0, 0, FLAGS, "force_oar" },
+     { "force_divisible_by", "enforce that the output resolution is divisible by a defined integer when force_original_aspect_ratio is used", OFFSET(force_divisible_by), AV_OPT_TYPE_INT, { .i64 = 1}, 1, 256, FLAGS },
+     { "reset_sar", "reset SAR to 1 and scale to square pixels if scaling proportionally", OFFSET(reset_sar), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, FLAGS },
++    { "tonemap",  "HDR to SDR tone mapping from the input's transfer and HDR10 metadata", OFFSET(tonemap), AV_OPT_TYPE_INT, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED }, AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED, AMF_VIDEO_CONVERTER_TONEMAPPING_2390, FLAGS, "tonemap" },
++    { "copy",     "Copy",     0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_COPY },     0, 0, FLAGS, "tonemap" },
++    { "amd",      "AMD",      0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_AMD },      0, 0, FLAGS, "tonemap" },
++    { "linear",   "Linear",   0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_LINEAR },   0, 0, FLAGS, "tonemap" },
++    { "gamma",    "Gamma",    0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_GAMMA },    0, 0, FLAGS, "tonemap" },
++    { "reinhard", "Reinhard", 0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_REINHARD }, 0, 0, FLAGS, "tonemap" },
++    { "bt2390",   "BT.2390",  0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_2390 },     0, 0, FLAGS, "tonemap" },
+ 
+     { NULL },
+ };
+@@ -233,7 +412,7 @@
+     {
+         .name         = "default",
+         .type         = AVMEDIA_TYPE_VIDEO,
+-        .filter_frame = amf_filter_filter_frame,
++        .filter_frame = vpp_amf_filter_frame,
+     }
+ };
+ 

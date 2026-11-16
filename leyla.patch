@@ -1,0 +1,389 @@
+diff --git a/debian/control b/debian/control
+index 2a036c8..6f8a47b 100644
+--- a/debian/control
++++ b/debian/control
+@@ -13,8 +13,6 @@ Build-Depends:
+  debhelper,
+ # for build-profile support
+  dpkg-dev,
+-# --enable-gnutls
+- libgnutls28-dev | libgnutls-dev,
+ # --enable-libbluray
+  libbluray-dev,
+ # --enable-gmp
+@@ -25,10 +23,6 @@ Build-Depends:
+  libopus-dev,
+ # --enable-libvorbis
+  libvorbis-dev,
+-# --enable-libopenmpt
+- libopenmpt-dev,
+-# --enable-libwebp
+- libwebp-dev,
+ # --enable-libvpx
+  libvpx-dev,
+ # --enable-libx264
+@@ -39,8 +33,6 @@ Build-Depends:
+  libzvbi-dev,
+ # --enable-cuda-llvm
+  clang:amd64,
+-# --enable-opencl
+- ocl-icd-opencl-dev,
+ # used to detect libraries
+  pkg-config | pkgconf,
+ # HTML documentation
+@@ -56,9 +48,6 @@ Conflicts: jellyfin-ffmpeg, jellyfin-ffmpeg5, jellyfin-ffmpeg6, jellyfin-ffmpeg7
+ Depends:
+  ${shlibs:Depends},
+  ${misc:Depends}
+-Suggests:
+- intel-opencl-icd [amd64],
+- intel-opencl-icd-legacy [amd64]
+ Description: Tools for transcoding, streaming and playing of multimedia files
+  FFmpeg is the leading multimedia framework, able to decode, encode, transcode,
+  mux, demux, stream, filter and play pretty much anything that humans and
+diff --git a/debian/rules b/debian/rules
+index 6a4ffca..13f49dc 100755
+--- a/debian/rules
++++ b/debian/rules
+@@ -8,7 +8,7 @@ PACKAGE_VERSION := "$(ORIG_VERSION)-$(VERSION_SUFFIX)"
+ 
+ CONFIG := --prefix=${TARGET_DIR} \
+ 	--target-os=linux \
+-	--extra-version=Jellyfin \
++	--extra-version=Jellyfin-Layla \
+ 	--disable-unstable \
+ 	--disable-doc \
+ 	--disable-ffplay \
+@@ -20,13 +20,15 @@ CONFIG := --prefix=${TARGET_DIR} \
+ 	--disable-xlib \
+ 	--disable-sdl2 \
+ 	--enable-lto=auto \
++	--toolchain=hardened \
++	--disable-network \
++	--disable-protocols \
++	--enable-protocol=file,pipe,fd,concat,data,subfile \
+ 	--enable-gpl \
+ 	--enable-version3 \
+ 	--enable-shared \
+ 	--enable-gmp \
+-	--enable-gnutls \
+ 	--enable-chromaprint \
+-	--enable-opencl \
+ 	--enable-libdrm \
+ 	--enable-libxml2 \
+ 	--enable-libass \
+@@ -37,22 +39,15 @@ CONFIG := --prefix=${TARGET_DIR} \
+ 	--enable-libbluray \
+ 	--enable-libmp3lame \
+ 	--enable-libopus \
+-	--enable-libtheora \
+ 	--enable-libvorbis \
+-	--enable-libopenmpt \
+ 	--enable-libdav1d \
+ 	--enable-libsvtav1 \
+-	--enable-libwebp \
+ 	--enable-libvpx \
+ 	--enable-libx264 \
+ 	--enable-libx265 \
+ 	--enable-libzvbi \
+ 	--enable-libzimg \
+-	--enable-libfdk-aac \
+-	--enable-libshaderc \
+-	--enable-libplacebo \
+-	--enable-vulkan \
+-	--enable-vulkan-static \
++	--enable-libvmaf \
+ 	--enable-vaapi \
+ 	--enable-ffnvcodec \
+ 	--enable-cuda \
+diff --git a/docker-build.sh b/docker-build.sh
+index 3e1682f..82639f9 100755
+--- a/docker-build.sh
++++ b/docker-build.sh
+@@ -193,58 +193,11 @@ prepare_extra_common() {
+     popd
+     popd
+ 
+-    # THEORA
+-    pushd ${SOURCE_DIR}
+-    git clone -b v1.2.0 --depth=1 https://github.com/xiph/theora.git
+-    pushd theora
+-    # autotools: relax autoconf requirement to 2.69
+-    wget -q -O - https://github.com/xiph/theora/commit/3ae2669.patch | git apply
+-    ./autogen.sh
+-    ./configure \
+-        ${CROSS_OPT} \
+-        --prefix=${TARGET_DIR} \
+-        --disable-{static,examples,extra-programs,oggtest,vorbistest,spec,doc} \
+-        --enable-shared \
+-        --with-pic
+-    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/theora
+-    echo "theora${TARGET_DIR}/lib/libtheora{enc,dec}.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+-    popd
+-
+-    # FFTW3
+-    pushd ${SOURCE_DIR}
+-    mkdir fftw3
+-    pushd fftw3
+-    fftw3_ver="3.3.11"
+-    fftw3_link="https://fftw.org/fftw-${fftw3_ver}.tar.gz"
+-    wget ${fftw3_link} -O fftw3.tar.gz
+-    tar xaf fftw3.tar.gz
+-    pushd fftw-${fftw3_ver}
+-    if [ "${ARCH}" = "amd64" ]; then
+-        fftw3_optimizations="--enable-sse2 --enable-avx --enable-avx-128-fma --enable-avx2 --enable-avx512"
+-    else
+-        fftw3_optimizations="--enable-neon"
+-    fi
+-    ./configure \
+-        ${CROSS_OPT} \
+-        --prefix=${TARGET_DIR} \
+-        --disable-{static,doc} \
+-        --enable-{shared,single,threads,fortran} \
+-        $fftw3_optimizations \
+-        --with-our-malloc \
+-        --with-combined-threads \
+-        --with-incoming-stack-boundary=2
+-    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/fftw3
+-    echo "fftw3${TARGET_DIR}/lib/libfftw3f.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+-    popd
+-    popd
+-
+     # CHROMAPRINT
+     pushd ${SOURCE_DIR}
+     git clone -b v1.6.0 --depth=1 https://github.com/acoustid/chromaprint.git
+     pushd chromaprint
+-    echo "Libs.private: -lfftw3f -lstdc++" >> libchromaprint.pc.cmake
++    echo "Libs.private: -lstdc++" >> libchromaprint.pc.cmake
+     echo "Cflags.private: -DCHROMAPRINT_NODLL" >> libchromaprint.pc.cmake
+     mkdir build
+     pushd build
+@@ -254,7 +207,8 @@ prepare_extra_common() {
+         -DCMAKE_BUILD_TYPE=Release \
+         -DBUILD_SHARED_LIBS=ON \
+         -DBUILD_{TOOLS,TESTS}=OFF \
+-        -DFFT_LIB=fftw3f \
++        -DFFT_LIB=kissfft \
++        -DKISSFFT_SOURCE_DIR=${SOURCE_DIR}/chromaprint/src/3rdparty/kissfft \
+         ..
+     make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/chromaprint
+     echo "chromaprint${TARGET_DIR}/lib/libchromaprint.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+@@ -290,6 +244,30 @@ prepare_extra_common() {
+     echo "dav1d/libdav1d.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+     popd
+ 
++    # LIBVMAF
++    # Leyla: the encode harness judges encodes by VMAF, and the
++    # harness and the shipped binary are one build. The v0.6.1, NEG and 4K
++    # models are compiled into the library (xxd embeds them), so
++    # `libvmaf=model=version=vmaf_v0.6.1neg` needs no file; the JSON files
++    # ship beside it for `model=path=`.
++    apt-get install -y xxd
++    pushd ${SOURCE_DIR}
++    git clone -b v3.2.1 --depth=1 https://github.com/Netflix/vmaf.git
++    meson setup vmaf/libvmaf vmaf_build \
++        ${MESON_CROSS_OPT} \
++        --prefix=${TARGET_DIR} \
++        --libdir=lib \
++        --buildtype=release \
++        -Ddefault_library=shared \
++        -Dbuilt_in_models=true \
++        -Denable_{tests,docs}=false
++    meson configure vmaf_build
++    ninja -j$(nproc) -C vmaf_build install
++    cp -a ${TARGET_DIR}/lib/libvmaf.so* ${SOURCE_DIR}/vmaf
++    echo "vmaf/libvmaf.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
++    echo "vmaf/model/vmaf_v0.6.1.json vmaf/model/vmaf_v0.6.1neg.json vmaf/model/vmaf_4k_v0.6.1.json vmaf/model/vmaf_4k_v0.6.1neg.json usr/lib/jellyfin-ffmpeg/share/vmaf" >> ${DPKG_INSTALL_LIST}
++    popd
++
+     # SVT-AV1
+     pushd ${SOURCE_DIR}
+     git clone -b v4.2.0 --depth=1 https://gitlab.com/AOMediaCodec/SVT-AV1.git
+@@ -308,25 +286,6 @@ prepare_extra_common() {
+     popd
+     popd
+ 
+-    # FDK-AAC-STRIPPED
+-    pushd ${SOURCE_DIR}
+-    mkdir fdk-aac-stripped
+-    pushd fdk-aac-stripped
+-    fdk_aac_ver="stripped5"
+-    fdk_aac_link="https://gitlab.freedesktop.org/wtaymans/fdk-aac-stripped/-/archive/${fdk_aac_ver}/fdk-aac-stripped-${fdk_aac_ver}.tar.gz"
+-    wget ${fdk_aac_link} -O fdk-aac-stripped.tar.gz
+-    tar xaf fdk-aac-stripped.tar.gz
+-    pushd fdk-aac-stripped-${fdk_aac_ver}
+-    ./autogen.sh
+-    ./configure \
+-        --disable-{static,silent-rules} \
+-        --prefix=${TARGET_DIR} CFLAGS="-O3 -DNDEBUG" CXXFLAGS="-O3 -DNDEBUG" ${CROSS_OPT}
+-    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/fdk-aac-stripped
+-    echo "fdk-aac-stripped${TARGET_DIR}/lib/libfdk-aac.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+-    popd
+-    popd
+-
+     # FFNVCODEC
+     pushd ${SOURCE_DIR}
+     git clone -b n12.0.16.1 --depth=1 https://github.com/FFmpeg/nv-codec-headers.git
+@@ -399,91 +358,11 @@ prepare_extra_common() {
+     popd
+     popd
+ 
+-    # Vulkan Headers
+-    pushd ${SOURCE_DIR}
+-    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Headers.git
+-    pushd Vulkan-Headers
+-    mkdir build && pushd build
+-    cmake \
+-        ${CMAKE_TOOLCHAIN_OPT} \
+-        -DCMAKE_BUILD_TYPE=Release \
+-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
+-    make -j$(nproc) && make install
+-    popd
+-    popd
+-    popd
+-
+-    # Vulkan ICD Loader
+-    pushd ${SOURCE_DIR}
+-    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Loader.git
+-    pushd Vulkan-Loader
+-    sed -i 's/memset(disable_struct, 0, sizeof.*);/& disable_struct->disable_all_implicit = 1;/' loader/loader_environment.c
+-    mkdir build && pushd build
+-    cmake \
+-        ${CMAKE_TOOLCHAIN_OPT} \
+-        -DCMAKE_BUILD_TYPE=Release \
+-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
+-        -DVULKAN_HEADERS_INSTALL_DIR="${TARGET_DIR}" \
+-        -DCMAKE_INSTALL_SYSCONFDIR=${TARGET_DIR}/share \
+-        -DCMAKE_INSTALL_DATADIR=${TARGET_DIR}/share \
+-        -DCMAKE_INSTALL_LIBDIR=lib \
+-        -DBUILD_TESTS=OFF \
+-        -DBUILD_WSI_{XCB,XLIB,XLIB_XRANDR,WAYLAND}_SUPPORT=OFF ..
+-    make -j$(nproc) && make install
+-    cp -a ${TARGET_DIR}/lib/libvulkan.so* ${SOURCE_DIR}/Vulkan-Loader
+-    echo "Vulkan-Loader/libvulkan.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+-    popd
+-    popd
+-
+-    # SHADERC
+-    shaderc_ver="v2026.2"
+-    pushd ${SOURCE_DIR}
+-    git clone -b ${shaderc_ver} --depth=1 https://github.com/google/shaderc.git
+-    pushd shaderc
+-    ./utils/git-sync-deps
+-    shaderc_conf=$(echo -GNinja \
+-        -DCMAKE_BUILD_TYPE=Release \
+-        -DSHADERC_SKIP_{TESTS,EXAMPLES,COPYRIGHT_CHECK}=ON \
+-        -DENABLE_EXCEPTIONS=ON \
+-        -DSPIRV_SKIP_EXECUTABLES=ON \
+-        -DSPIRV_TOOLS_BUILD_STATIC=ON \
+-        -DBUILD_SHARED_LIBS=OFF)
+-    # Build native glslangValidator for crossbuild
+-    if [ "${ARCH}" != "amd64" ]; then
+-        mkdir glslang_build && pushd glslang_build
+-        cmake $shaderc_conf \
+-            -DENABLE_GLSLANG_BINARIES=ON ..
+-        ninja -j$(nproc) third_party/glslang/StandAlone/glslang
+-        cp third_party/glslang/StandAlone/glslangValidator ${TARGET_DIR}/bin
+-        popd
+-    fi
+-    # Build target shaderc
+-    mkdir shaderc_build && pushd shaderc_build
+-    cmake $shaderc_conf \
+-        ${CMAKE_TOOLCHAIN_OPT} \
+-        -DENABLE_GLSLANG_BINARIES=$([ "${ARCH}" = "amd64" ] && echo "ON" || echo "OFF") \
+-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
+-    ninja -j$(nproc)
+-    ninja install
+-    cp -a ${TARGET_DIR}/lib/libshaderc_shared.so* ${SOURCE_DIR}/shaderc
+-    echo "shaderc/libshaderc_shared* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+-    popd
+-    popd
+-
+     # MESA
+     # Minimal libs for AMD VAAPI, AMD RADV and Intel ANV
+     if [[ ${LLVM_VER} -ge 15 ]]; then
+-        if [[ "${ARCH}" = "amd64" && ${LLVMSPIRVLIB_VER} -ge 15 && ${LLVMSPIRVLIB_VER} -le 21 ]]; then
+-            # Intel ANV requires llvmspirvlib >= 15 (and <= 21 in mesa 26.0)
+-            mesa_vk_drv="amd,intel"
+-            mesa_llvm_clc="enabled"
+-            apt-get install -y {llvm-,libllvmspirvlib-,libclc-,libclang-,libclang-cpp}${LLVMSPIRVLIB_VER}-dev
+-        else
+-            mesa_vk_drv="amd"
+-            mesa_llvm_clc="disabled"
+-        fi
++        # Layla: VAAPI (radeonsi) only. No Vulkan drivers, so no LLVM/CLC.
++        mesa_llvm_clc="disabled"
+         pushd ${SOURCE_DIR}
+         mkdir mesa
+         pushd mesa
+@@ -501,9 +380,8 @@ prepare_extra_common() {
+             -Db_lto=false \
+             -Dplatforms=[] \
+             -Dgallium-drivers=radeonsi \
+-            -Dvulkan-drivers=${mesa_vk_drv} \
++            -Dvulkan-drivers=[] \
+             -Dvulkan-layers=[] \
+-            -Dvulkan-manifest-per-architecture=true \
+             -Degl=disabled \
+             -Dgallium-{extra-hud,rusticl}=false \
+             -Dgallium-mediafoundation=disabled \
+@@ -526,42 +404,15 @@ prepare_extra_common() {
+             -Dintel-elk=false
+         meson configure mesa_build
+         ninja -j$(nproc) -C mesa_build install
+-        cp -a ${TARGET_DIR}/lib/libvulkan_*.so ${SOURCE_DIR}/mesa
+         # radeonsi_drv_video.so -> libgallium_drv_video.so is soft link
+         cp ${TARGET_DIR}/lib/dri/radeonsi_drv_video.so ${SOURCE_DIR}/mesa
+-        echo "mesa/lib*.so usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+         echo "mesa/radeonsi_drv_video.so usr/lib/jellyfin-ffmpeg/lib/dri" >> ${DPKG_INSTALL_LIST}
+         cp ${TARGET_DIR}/share/drirc.d/*.conf ${SOURCE_DIR}/mesa
+         echo "mesa/*defaults.conf usr/lib/jellyfin-ffmpeg/share/drirc.d" >> ${DPKG_INSTALL_LIST}
+-        cp ${TARGET_DIR}/share/vulkan/icd.d/*.json ${SOURCE_DIR}/mesa
+-        echo "mesa/*icd.*.json usr/lib/jellyfin-ffmpeg/share/vulkan/icd.d" >> ${DPKG_INSTALL_LIST}
+         popd
+         popd
+     fi
+ 
+-    # LIBPLACEBO
+-    pushd ${SOURCE_DIR}
+-    git clone -b v7.360.1 --recursive --depth=1 https://github.com/haasn/libplacebo.git
+-    # Fix bit shift when importing P01x non-multiplane image
+-    git -C libplacebo apply ${SOURCE_DIR}/builder/patches/libplacebo/*.patch
+-    sed -i 's/env: python_env,//g' libplacebo/src/vulkan/meson.build
+-    meson setup libplacebo placebo_build \
+-        ${MESON_CROSS_OPT} \
+-        --prefix=${TARGET_DIR} \
+-        --libdir=lib \
+-        --buildtype=release \
+-        --default-library=shared \
+-        -Dvulkan=enabled \
+-        -Dvk-proc-addr=enabled \
+-        -Dvulkan-registry=${TARGET_DIR}/share/vulkan/registry/vk.xml \
+-        -Dshaderc=enabled \
+-        -Dglslang=disabled \
+-        -D{demos,tests,bench,fuzz}=false
+-    meson configure placebo_build
+-    ninja -j$(nproc) -C placebo_build install
+-    cp -a ${TARGET_DIR}/lib/libplacebo.so* ${SOURCE_DIR}/libplacebo
+-    echo "libplacebo/libplacebo* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+-    popd
+ }
+ 
+ # Prepare extra headers, libs and drivers for x86_64-linux-gnu
+@@ -814,3 +665,11 @@ popd
+ mkdir -p ${ARTIFACT_DIR}/deb
+ mv /jellyfin-ffmpeg{,8}_* ${ARTIFACT_DIR}/deb/
+ chown -Rc $(stat -c %u:%g ${ARTIFACT_DIR}) ${ARTIFACT_DIR}
++
++# Layla: the corresponding source of everything built above (GPL-3.0 §6),
++# without build products. Published beside the packages.
++tar -C / --exclude-vcs \
++    --exclude='*.o' --exclude='*.lo' --exclude='*.a' --exclude='*.so' --exclude='*.so.*' \
++    --exclude='*_build' --exclude='ffmpeg/debian/jellyfin-ffmpeg8' \
++    -czf ${ARTIFACT_DIR}/source-${ARCH}.tar.gz ffmpeg
++chown -Rc $(stat -c %u:%g ${ARTIFACT_DIR}) ${ARTIFACT_DIR}

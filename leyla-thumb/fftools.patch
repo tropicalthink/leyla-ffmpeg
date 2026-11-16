@@ -1,0 +1,48 @@
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -4365,6 +4365,9 @@ ffplay_deps="avcodec avformat avfilter swscale swresample sdl2"
+ ffplay_select="crop_filter transpose_filter hflip_filter vflip_filter rotate_filter"
+ ffplay_suggest="shell32 libplacebo vulkan"
+ ffprobe_deps="avcodec avformat"
++# Leyla: `ffprobe -leyla_thumb`, the keyframe thumbnailer leyla-server
++# talks to over a pipe (fftools/leyla_thumb.c), scales and encodes JPEG.
++ffprobe_select="mjpeg_encoder swscale"
+ ffprobe_suggest="shell32"
+ 
+ # documentation
+diff --git a/fftools/Makefile b/fftools/Makefile
+--- a/fftools/Makefile
++++ b/fftools/Makefile
+@@ -39,6 +39,7 @@ OBJS-ffmpeg +=                  \
+     $(RESOBJS)                        \
+ 
+ OBJS-ffprobe +=                       \
++    fftools/leyla_thumb.o             \
+     fftools/textformat/avtextformat.o \
+     fftools/textformat/tf_compact.o   \
+     fftools/textformat/tf_default.o   \
+diff --git a/fftools/ffprobe.c b/fftools/ffprobe.c
+--- a/fftools/ffprobe.c
++++ b/fftools/ffprobe.c
+@@ -3328,6 +3328,8 @@ static inline int check_section_show_entries(int section_id)
+             do_show_##varname = 1;                                      \
+     } while (0)
+ 
++int leyla_thumb_main(int argc, char **argv);
++
+ int main(int argc, char **argv)
+ {
+     const AVTextFormatter *f;
+@@ -3338,6 +3340,11 @@ int main(int argc, char **argv)
+     int ret, input_ret;
+     AVTextFormatDataDump data_dump_format_id = AV_TEXTFORMAT_DATADUMP_XXD;
+ 
++    /* Leyla: the scrub-preview thumbnailer, before any of ffprobe's own
++     * option handling (deploy/ffmpeg/leyla-thumb). */
++    if (argc > 1 && !strcmp(argv[1], "-leyla_thumb"))
++        return leyla_thumb_main(argc - 1, argv + 1);
++
+     init_dynload();
+ 
+     setvbuf(stderr, NULL, _IONBF, 0); /* win32 runtime needs this */
